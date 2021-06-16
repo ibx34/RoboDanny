@@ -3,17 +3,22 @@ from .utils import checks, db, time, cache
 from .utils.formats import plural
 from collections import Counter, defaultdict
 from inspect import cleandoc
+from dataclasses import dataclass
 
 import re
 import json
 import discord
 import enum
-import datetime
+from datetime import datetime
+import time as timee
 import asyncio
 import argparse, shlex
 import logging
 import asyncpg
 import io
+import typing
+import pytz
+from textwrap import dedent
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +46,24 @@ class GuildConfig(db.Table, table_name='guild_mod_config'):
     safe_mention_channel_ids = db.Column(db.Array(db.Integer(big=True)))
     mute_role_id = db.Column(db.Integer(big=True))
     muted_members = db.Column(db.Array(db.Integer(big=True)))
+    mod_logs = db.Column(db.Integer(big=True))
+
+class GuildCases(db.Table, table_name='guild_mod_cases'):
+    id = db.PrimaryKeyColumn()
+    mod_id = db.Column(db.Integer(big=True))
+    target_id = db.Column(db.Integer(big=True))
+    guild_id = db.Column(db.Integer(big=True))
+    role_id = db.Column(db.Integer(big=True))
+    role_name = db.Column(db.String)
+    reason = db.Column(db.String)
+    type = db.Column(db.String)
+    message_id = db.Column(db.Integer(big=True))
 
 ## Configuration
 
 class ModConfig:
     __slots__ = ('raid_mode', 'id', 'bot', 'broadcast_channel_id', 'mention_count',
-                 'safe_mention_channel_ids', 'mute_role_id', 'muted_members')
+                 'safe_mention_channel_ids', 'mute_role_id', 'muted_members', 'mod_logs_id')
 
     @classmethod
     async def from_record(cls, record, bot):
@@ -61,6 +78,7 @@ class ModConfig:
         self.safe_mention_channel_ids = set(record['safe_mention_channel_ids'] or [])
         self.muted_members = set(record['muted_members'] or [])
         self.mute_role_id = record['mute_role_id']
+        self.mod_logs_id = record['mod_logs']
         return self
 
     @property
@@ -73,12 +91,38 @@ class ModConfig:
         guild = self.bot.get_guild(self.id)
         return guild and self.mute_role_id and guild.get_role(self.mute_role_id)
 
+    @property
+    def mod_logs(self):
+        guild = self.bot.get_guild(self.id)
+        return guild and self.mod_logs_id and guild.get_channel(self.mod_logs_id)
+
     def is_muted(self, member):
         return member.id in self.muted_members
 
     async def apply_mute(self, member, reason):
         if self.mute_role_id:
             await member.add_roles(discord.Object(id=self.mute_role_id), reason=reason)
+
+class ModCase:
+    __slots__ = ('id','mod_id','target_id','guild_id','role_id','role_name',
+                'reason','type','message_id')
+
+    @classmethod
+    async def from_record(cls, record, bot):
+        self = cls()
+
+        # the basic configuration
+        self.bot = bot
+        self.id = record['id']
+        self.mod_id = record['mod_id']
+        self.target_id = record['target_id']
+        self.guild_id = record['guild_id']
+        self.role_id = record['role_id']
+        self.role_name = record['role_name']
+        self.reason = record['reason']
+        self.type = record['type']
+        self.message_id = record['message_id']
+        return self
 
 ## Converters
 
@@ -168,7 +212,7 @@ class SpamChecker:
         self.hit_and_run = commands.CooldownMapping.from_cooldown(10, 12, commands.BucketType.channel)
 
     def is_new(self, member):
-        now = datetime.datetime.utcnow()
+        now = datetime.utcnow()
         seven_days_ago = now - datetime.timedelta(days=7)
         ninety_days_ago = now - datetime.timedelta(days=90)
         return member.created_at > ninety_days_ago and member.joined_at > seven_days_ago
@@ -200,7 +244,7 @@ class SpamChecker:
         return False
 
     def is_fast_join(self, member):
-        joined = member.joined_at or datetime.datetime.utcnow()
+        joined = member.joined_at or datetime.utcnow()
         if self.last_join is None:
             self.last_join = joined
             return False
@@ -426,7 +470,7 @@ class Mod(commands.Cog):
         if not config.raid_mode:
             return
 
-        now = datetime.datetime.utcnow()
+        now = datetime.utcnow()
 
         is_new = member.created_at > (now - datetime.timedelta(days=7))
         checker = self._spam_check[guild_id]
@@ -782,7 +826,8 @@ class Mod(commands.Cog):
         `--joined-after`: Matches users who joined after the member ID given.
         `--no-avatar`: Matches users who have no avatar. (no arguments)
         `--no-roles`: Matches users that have no role. (no arguments)
-        `--show`: Show members instead of banning them (no arguments).
+        `--show`: Show members instead of banning them (no arguments)
+        `--kick`: Kicks members instead of banning them (no arguments)
 
         Message history filters (Requires `--channel`):
 
@@ -825,6 +870,7 @@ class Mod(commands.Cog):
         parser.add_argument('--ends')
         parser.add_argument('--match')
         parser.add_argument('--show', action='store_true')
+        parser.add_argument('--kick', action='store_true')
         parser.add_argument('--embeds', action='store_const', const=lambda m: len(m.embeds))
         parser.add_argument('--files', action='store_const', const=lambda m: len(m.attachments))
         parser.add_argument('--after', type=int)
@@ -893,7 +939,7 @@ class Mod(commands.Cog):
         if args.no_roles:
             predicates.append(lambda m: len(getattr(m, 'roles', [])) <= 1)
 
-        now = datetime.datetime.utcnow()
+        now = datetime.utcnow()
         if args.created:
             def created(member, *, offset=now - datetime.timedelta(minutes=args.created)):
                 return member.created_at > offset
@@ -923,7 +969,7 @@ class Mod(commands.Cog):
         if args.show:
             members = sorted(members, key=lambda m: m.joined_at or now)
             fmt = "\n".join(f'{m.id}\tJoined: {m.joined_at}\tCreated: {m.created_at}\t{m}' for m in members)
-            content = f'Current Time: {datetime.datetime.utcnow()}\nTotal members: {len(members)}\n{fmt}'
+            content = f'Current Time: {datetime.utcnow()}\nTotal members: {len(members)}\n{fmt}'
             file = discord.File(io.BytesIO(content.encode('utf-8')), filename='members.txt')
             return await ctx.send(file=file)
 
@@ -939,13 +985,16 @@ class Mod(commands.Cog):
         count = 0
         for member in members:
             try:
-                await ctx.guild.ban(member, reason=reason)
+                if args.kick:
+                    await ctx.guild.kick(member, reason=reason)
+                else:
+                    await ctx.guild.ban(member, reason=reason) 
             except discord.HTTPException:
                 pass
             else:
                 count += 1
 
-        await ctx.send(f'Banned {count}/{len(members)}')
+        await ctx.send(f'Banned/Kicked {count}/{len(members)}')
 
     @commands.command()
     @commands.guild_only()
@@ -1438,6 +1487,206 @@ class Mod(commands.Cog):
                 skipped += 1
         return success, failure, skipped
 
+    @commands.command(name='warn')
+    @checks.has_guild_permissions(manage_messages=True)
+    async def warn(self, ctx, member: discord.Member, *, reason: ActionReason):
+        """Adds a warning to a use.
+
+        To use this command you need to be higher than the
+        member in the hierarchy and have Manage Messages
+        permission at the server level.
+        """
+
+        config = await self.get_guild_config(ctx.guild.id)
+
+        if not can_execute_action(ctx, ctx.author, member):
+           return await ctx.send('You cannot do this action on this user due to role hierarchy.')
+
+        try:
+            query = "INSERT INTO guild_mod_cases(mod_id,target_id,guild_id,type,reason)" \
+                    "VALUES ($1,$2,$3,$4,$5) RETURNING *, (SELECT count(*) FROM guild_mod_cases WHERE type = $4 AND target_id = $2 AND guild_id = $3)"
+
+
+            data = await self.bot.pool.fetchrow(query, ctx.author.id, member.id, ctx.guild.id, "warning", reason)
+            escaped = discord.utils.escape_mentions(member.name)
+
+            if config:
+                channel = config.mod_logs
+                if channel is None:
+                    return
+
+                @dataclass
+                class fake_log:
+
+                    target: discord.Member
+                    user: discord.Member
+                    guild: discord.Guild
+                    reason: str
+
+                embed = await self.build_embed(fake_log(target=member,user=ctx.author,guild=ctx.guild,reason=reason),"Warn",jump_to=ctx.message.jump_url,special_data=data)
+                await channel.send(embed=embed)
+
+            strikes = data['count']
+            
+            def decide_strikes(strikes):
+                if strikes > 1:
+                    return strikes-1
+                return strikes
+
+            await ctx.send(f"""\N{OK HAND SIGN} Warned **{escaped}** ({decide_strikes(strikes)} → {strikes if strikes != 0 else 1}).""")
+
+        except Exception as err:
+            return await ctx.send(f'There was an error.```{err}```')
+
+    @commands.command(name='pardon')
+    @checks.has_guild_permissions(manage_messages=True)
+    async def pardon(self, ctx, member: discord.Member, amount: int):
+
+        query = f"SELECT * FROM guild_mod_cases WHERE guild_id = $1 AND target_id = $2 AND type = $3 ORDER BY id DESC"
+        data = await self.bot.pool.fetch(query, ctx.guild.id, member.id, "warning") 
+
+        ids = [x['id'] for x in data[:amount]]
+
+        if len(ids) == 0:
+            return await ctx.send("This user has no warnigns to pardon.")
+
+        msg = f'You\'re about to pardon this user of **{len(ids)}** warnings, are you sure?\nMight want to check the following cases before continuing\n\n{", ".join([str(x) for x in ids])}'
+        
+        confirm = await ctx.prompt(msg, reacquire=False)
+        if not confirm:
+            return await ctx.send('Aborting.')
+
+        delete_query = f"DELETE FROM guild_mod_cases WHERE id IN ({','.join(str(id) for id in ids)})"
+        await self.bot.pool.fetch(delete_query)
+
+        escaped = discord.utils.escape_mentions(member.name)
+        await ctx.send(f"\N{OK HAND SIGN} Pardoned **{escaped}** ({len(data)} → {len(data) - len(ids)}).")
+
+    @commands.group(name='case',invoke_without_command=True)
+    # @checks.has_guild_permissions(manage_messages=True)
+    async def _case(self, ctx, argument: typing.Union[discord.Member, int]):
+        """Gets all of a user's cases or displays a certain case.
+
+        You must provide either a valid user, or case id. It will automatically
+        show the correct data denpending on what you provide. You can get case id's
+        by providing a member.
+        """
+
+        query = 'SELECT * FROM guild_mod_cases WHERE {type} = $1 AND guild_id = $2'       
+        format_string = query.format(type='target_id' if type(argument) == discord.Member \
+                                    else 'id')
+
+        if type(argument) == discord.Member:
+            data = await self.bot.pool.fetch(format_string, argument.id, ctx.guild.id)
+
+            escaped = discord.utils.escape_mentions(argument.name)
+            to_send = f'Showing all cases for: **{escaped}** (ID: {argument.id})' \
+                        f"""\n\n{', '.join([f"{case['id']}" for case in data])}"""
+        elif type(argument) == int: 
+            data = await self.bot.pool.fetchrow(format_string, argument, ctx.guild.id)     
+            target = await self.bot.get_or_fetch_member(ctx.guild, data['target_id'])
+            mod = await self.bot.get_or_fetch_member(ctx.guild, data['mod_id'])
+
+            to_send = f'**{data["type"].capitalize()}** | Case {data["id"]}\n' \
+                      f'**User**: {target} ({target.id})\n' \
+                      f'**Reason**: {data["reason"]}\n' \
+                      f'**Responsible moderator**: {mod}\n'
+
+        else: 
+            return await ctx.send('How did you get here?')
+        
+        await ctx.send(to_send)
+
+    @_case.command(name="delete")
+    @checks.has_guild_permissions(administrator=True)
+    async def _case_delete(self, ctx, cases: commands.Greedy[int]):
+        """Deletes all provided cases. 
+
+        You can provide 1 or more cases to delete. You must be the owner of the
+        server to run this command. Why? Because im not going to get every
+        case you provide just to check if you're the moderator who gave it
+        """
+
+        if ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send('You\'re not the owner of this server.')
+        
+        delete_query1 = f"DELETE FROM guild_mod_cases WHERE id IN ({','.join(str(x) for x in cases)}) AND guild_id = $1"
+        delete_query2 = "DELETE FROM guild_mod_cases WHERE id = $1 AND guild_id = $2"
+
+        if len(cases) == 1:
+            await self.bot.pool.execute(delete_query2, cases[0], ctx.guild.id)
+            await ctx.send(f"\N{OK HAND SIGN}")
+        elif len(cases) > 1:
+            if len(cases) > 10:
+                msg = f'You\'re about to delete **{len(cases)}** cases, are you sure?' \
+                       'Look over all case ids you provided to make sure you didn\'t add one by mistake!'
+                    
+                confirm = await ctx.prompt(msg, reacquire=False)
+                if not confirm:
+                    return await ctx.send('Aborting.')
+                
+            await self.bot.pool.execute(delete_query1, ctx.guild.id)
+            await ctx.send(f"\N{OK HAND SIGN}")            
+
+    @_case.command(name="reset_all",aliases=["delete_all","reset"])
+    @checks.has_guild_permissions(administrator=True)
+    async def _case_delete_all(self, ctx):
+        """Deletes all server cases. 
+
+        You must have Administrator, and be the server owner to use this command.
+        """
+
+        if ctx.author.id != ctx.guild.owner_id:
+            return await ctx.send('You\'re not the owner of this server.')
+        
+        query = f"DELETE FROM guild_mod_cases WHERE guild_id = $1" 
+        await self.bot.pool.execute(query, ctx.guild.id)
+        await ctx.send(f"\N{OK HAND SIGN}") 
+
+    @_case.command(name="transfer")
+    @checks.has_guild_permissions(manage_messages=True)
+    async def _case_transfer(self, ctx, id: int, moderator: discord.Member):
+        """Transfers a case from one moderator, to another.
+
+        You must have Manage Messages on the server level, and be the owner
+        of the provided case.
+        """
+        
+        query = 'SELECT * FROM guild_mod_cases WHERE id = $1 AND guild_id = $2'    
+        transfer_query = 'UPDATE guild_mod_cases SET mod_id = $1 WHERE id = $2 AND guild_id = $3'
+
+
+        case = await self.bot.pool.fetchrow(query, id, ctx.guild.id)
+
+        if case['mod_id'] != ctx.author.id:
+            if ctx.author.id != ctx.guild.owner_id:
+                return await ctx.send('You\'re not the original owner of the case!')
+
+        await self.bot.pool.execute(transfer_query, moderator.id, id, ctx.guild.id) 
+        await ctx.send(f"\N{OK HAND SIGN}") 
+
+    @commands.command(name='reason')
+    @checks.has_guild_permissions(manage_messages=True)
+    async def reason(self, ctx, id: int, *, reason: ActionReason):
+        """Updates a case's resaon. 
+
+        You must be the case moderator, or server owner. And have Manage 
+        Messages permission at the server level.
+        """
+
+        query = 'SELECT * FROM guild_mod_cases WHERE id = $1 AND guild_id = $2'               
+        data = await self.bot.pool.fetchrow(query, id, ctx.guild.id)
+
+        if not data:
+            return await ctx.send('That case doesn\'t exist.')
+        
+        if ctx.author.id != data['mod_id']:
+            if ctx.author.id != ctx.guild.owner_id:
+                return await ctx.send('You must be the moderator of the case, or owner of the server.')
+        
+        await self.bot.pool.execute("UPDATE guild_mod_cases SET reason = $1 WHERE guild_id = $2 AND id = $3",reason, ctx.guild.id, id)
+        await ctx.send(f'\N{OK HAND SIGN} Updated case **#{id}**\'s reason.')
+
     @commands.group(name='mute', invoke_without_command=True)
     @can_mute()
     async def _mute(self, ctx, members: commands.Greedy[discord.Member], *, reason: ActionReason = None):
@@ -1577,6 +1826,152 @@ class Mod(commands.Cog):
             # if the request failed then just do it manually
             async with self._batch_lock:
                 self._data_batch[guild_id].append((member_id, False))
+
+    @commands.group(name="modlogs", invoke_without_command=True)
+    @checks.has_guild_permissions(manage_guild=True, manage_channels=True)
+    async def _modlogs(self, ctx):
+        """Shows configuration of the modlogs channel.
+
+        To use these commands you need to have Manage Channels
+        and Manage Server permission at the server level.
+        """
+
+        config = await self.get_guild_config(ctx.guild.id)
+        channel = config and config.mod_logs
+
+        if channel is not None:
+            channel = f"{channel} (ID: {channel.id})"
+        
+        await ctx.send(f'Modlogs: {channel}')
+
+    @_modlogs.command(name='set')
+    @checks.has_guild_permissions(manage_guild=True, manage_channels=True)
+    @commands.cooldown(1, 60.0, commands.BucketType.guild)
+    async def modlogs_set(self, ctx, *, channel: discord.TextChannel):
+        """Sets the modlogs channel to a pre-existing channel.
+
+        This command can only be used once every minute.
+
+        To use these commands you need to have Manage Channels
+        and Manage Server permission at the server level.
+        """
+
+        config = await self.get_guild_config(ctx.guild.id)
+        has_pre_existing = config is not None and config.mod_logs is not None
+        author_id = ctx.author.id
+
+        if has_pre_existing:
+            msg = '\N{WARNING SIGN} **There seems to be a pre-existing modlogs channel set up.**\n\n' \
+                  'Are you sure you want to update it? You won\'t be able to update old modlog messages'
+
+            confirm = await ctx.prompt(msg, reacquire=False)
+            if not confirm:
+                return await ctx.send('Aborting.')
+
+        else:
+            msg = f'Are you sure you want to make this the modlogs channel?'
+            confirm = await ctx.prompt(msg, reacquire=False)
+            if not confirm:
+                return await ctx.send('Aborting.')
+
+        async with ctx.typing():
+
+            query = """INSERT INTO guild_mod_config (id, mod_logs)
+                   VALUES ($1, $2) ON CONFLICT (id)
+                   DO UPDATE SET
+                        mod_logs = EXCLUDED.mod_logs
+                """
+            await self.bot.pool.execute(query, ctx.guild.id, channel.id)
+            self.get_guild_config.invalidate(self, ctx.guild.id)
+
+            escaped = discord.utils.escape_mentions(channel.name)
+            await ctx.send(f'Successfully set the {escaped} channel as the modlogs channel.')
+
+    @_modlogs.command(name='unbind')
+    @checks.has_guild_permissions(manage_guild=True, manage_channels=True)
+    @commands.cooldown(1, 60.0, commands.BucketType.guild)
+    async def modlogs_unbind(self, ctx):
+        """Unbinds a modlog channel without deleting it.
+
+        To use these commands you need to have Manage Channels
+        and Manage Server permission at the server level.
+        """
+
+        guild_id = ctx.guild.id
+        config = await self.get_guild_config(guild_id)
+        if config is None or config.mod_logs is None:
+            return await ctx.send('No modlogs channel is set up.')
+
+        query = """UPDATE guild_mod_config SET mod_logs = NULL WHERE id=$1"""
+        await self.bot.pool.execute(query, guild_id)
+        self.get_guild_config.invalidate(self, guild_id)
+
+        await ctx.send('Successfully unbound the modlogs channel.')
+
+    @_modlogs.command(name='delete')
+    @checks.has_guild_permissions(manage_guild=True, manage_channels=True)
+    @commands.cooldown(1, 60.0, commands.BucketType.guild)
+    async def modlogs_delete(self, ctx):
+        """Deletes a modlog channel, and optionally all cases stored.
+
+        To use these commands you need to have Manage Channels
+        and Manage Server permission at the server level.
+        """
+
+        guild_id = ctx.guild.id
+        config = await self.get_guild_config(guild_id)
+        if config is None or config.mod_logs is None:
+            return await ctx.send('No modlogs channel is set up.')
+        
+        try:
+            query = """UPDATE guild_mod_config SET mod_logs = NULL WHERE id=$1"""
+            await self.bot.pool.execute(query, guild_id)
+
+            msg = 'Do you want to delete to delete all stored mod cases with the channel?'
+            confirm = await ctx.prompt(msg, reacquire=False)
+
+            if confirm:
+                query = """DELETE FROM guild_mod_cases WHERE guild_id = $1"""
+                await self.bot.pool.execute(query, guild_id)
+            
+            await config.mod_logs.delete()
+            self.get_guild_config.invalidate(self, guild_id)
+        except Exception as err:
+            return await ctx.send(f'Error while deleting modlogs.```{err}```')
+
+        await ctx.send('Successfully deleted the modlogs channel.')
+
+    @_modlogs.command(name='create')
+    @checks.has_guild_permissions(manage_guild=True, manage_channels=True)
+    @commands.cooldown(1, 60.0, commands.BucketType.guild)
+    async def modlogs_create(self, ctx, *, name):
+        """Creates a modlogs channel with the given name.
+
+
+        To use these commands you need to have Manage Channels
+        and Manage Server permission at the server level.
+        """
+
+        guild_id = ctx.guild.id
+        config = await self.get_guild_config(guild_id)
+        if config is not None and config.mod_logs is not None:
+            return await ctx.send('A modlogs channel already exists.')
+
+        try:
+            channel = await ctx.guild.create_text_channel(name=name, reason=f'Modlogs Channel Created By {ctx.author} (ID: {ctx.author.id})')
+        except discord.HTTPException as e:
+            return await ctx.send(f'An error happened: {e}')
+
+        query = """INSERT INTO guild_mod_config (id, mod_logs)
+                   VALUES ($1, $2) ON CONFLICT (id)
+                   DO UPDATE SET
+                       mod_logs = EXCLUDED.mod_logs;
+                """
+        await ctx.db.execute(query, guild_id, channel.id) 
+        self.get_guild_config.invalidate(self, guild_id)
+
+        async with ctx.typing():
+            await ctx.send('Modlog channel successfully created.')
 
     @_mute.group(name='role', invoke_without_command=True)
     @checks.has_guild_permissions(manage_guild=True, manage_roles=True)
@@ -1817,6 +2212,227 @@ class Mod(commands.Cog):
     async def on_selfmute_error(self, ctx, error):
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send('Missing a duration to selfmute for.')
+
+    # Mod logs stuff
+
+    async def find_actual_log(self, guild, action, matcher, check_limit, retry):
+        try:
+            if guild.me is None:
+                return None
+            entry = None
+            if guild.me.guild_permissions.view_audit_log:
+                try:
+                    async for e in guild.audit_logs(action=action, limit=check_limit):
+                        if matcher(e):
+                            if entry is None or e.id > entry.id:
+                                entry = e
+                except discord.Forbidden:
+                    pass
+            if entry is None and retry:
+                await asyncio.sleep(2)
+                return await self.find_log(guild, action, matcher, check_limit, False)
+            if entry is not None and isinstance(entry.target, discord.Object):
+                entry.target = await self.blobster.get_or_fetch_member(entry.target.id)
+            return entry
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+
+    async def find_log(self, guild, action, matcher, check_limit=10, retry=True):
+        try:
+            return await asyncio.wait_for(
+                self.find_actual_log(guild, action, matcher, check_limit, retry), 10
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            return None
+
+    async def build_embed(self, entry, type, jump_to=None, special_data=None):
+        if type.lower() != "warn":
+            try:
+                query = """INSERT INTO guild_mod_cases(mod_id,target_id,guild_id,reason,type)
+                            VALUES($1,$2,$3,$4,$5) RETURNING id"""
+
+                id = await self.bot.pool.fetchrow(query, entry.user.id, entry.target.id,
+                                    entry.guild.id,entry.reason,type.lower())
+            except Exception as err:
+                print(err) 
+        
+        if type.lower() == "warn":
+            id = special_data
+
+        embed = discord.Embed(timestamp=datetime.utcnow())
+        embed.color = 0x7289da
+        embed.title = f"Case {id['id']} | {type}"
+        embed.add_field(
+            name="User",
+            value=f"{entry.target} (<@{entry.target.id}>)",
+            inline=False
+        )
+        embed.add_field(
+            name="Moderator",
+            value=f"{entry.user} (<@{entry.user.id}>)",
+            inline=False
+        )
+        embed.add_field(
+            name="Reason",
+            value=f"{entry.reason}",
+            inline=False
+        )
+        
+        if jump_to:
+            embed.add_field(
+                name="Jump To",
+                value=jump_to,
+                inline=False
+            )
+
+        return embed
+
+    @commands.Cog.listener()
+    async def on_member_ban(self, guild, user):
+
+        config = await self.get_guild_config(guild.id)
+        channel = config and config.mod_logs
+
+        if channel is None:
+            return
+        
+        if user.id == self.bot.user.id:
+            return
+
+        reason = None
+        timestamp = datetime.utcnow()
+        fid = f"{guild.id}-{user.id}"
+        limit = datetime.utcfromtimestamp(timee.time() - 60)
+        log = await self.find_log(guild,discord.AuditLogAction.ban,lambda e: e.target == user and e.created_at.replace(tzinfo=pytz.UTC) > limit.replace(tzinfo=pytz.UTC))
+
+        if log is None:
+            await asyncio.sleep(1)
+            log = await self.find_log(guild,discord.AuditLogAction.ban,lambda e: e.target == user and e.created_at.replace(tzinfo=pytz.UTC)> limit.replace(tzinfo=pytz.UTC),)
+            
+        if log is not None:
+            embed = await self.build_embed(log,"Ban")
+            await channel.send(embed=embed)
+
+    @commands.Cog.listener()
+    async def on_member_unban(self, guild, user):
+
+        config = await self.get_guild_config(guild.id)
+        channel = config and config.mod_logs
+
+        if channel is None:
+            return
+
+        if user.id == self.bot.user.id:
+            return
+
+        reason = None
+        timestamp = datetime.utcnow()
+        fid = f"{guild.id}-{user.id}"
+        limit = datetime.utcfromtimestamp(timee.time() - 60)
+        log = await self.find_log(guild,discord.AuditLogAction.ban,lambda e: e.target == user and e.created_at.replace(tzinfo=pytz.UTC) > limit.replace(tzinfo=pytz.UTC))
+
+        if log is None:
+            await asyncio.sleep(1)
+            log = await self.find_log(guild,discord.AuditLogAction.ban,lambda e: e.target == user and e.created_at.replace(tzinfo=pytz.UTC)> limit.replace(tzinfo=pytz.UTC),)
+            
+        if log is not None:
+            embed = await self.build_embed(log,"Unban")
+            await channel.send(embed=embed)
+
+    @commands.Cog.listener()
+    async def on_member_remove(self, user):
+        config = await self.get_guild_config(user.guild.id)
+        channel = config and config.mod_logs
+
+        if channel is None:
+            return
+
+        if user.id == self.bot.user.id:
+            return
+
+        timestamp = datetime.utcnow()
+        fid = f"{user.guild.id}-{user.id}"
+        limit = datetime.utcfromtimestamp(timee.time() - 60)
+        async for entry in user.guild.audit_logs(
+            action=discord.AuditLogAction.kick, limit=25
+        ):
+            if (
+                user.joined_at is None
+                or user.joined_at > entry.created_at
+                or entry.created_at < datetime.utcfromtimestamp(timee.time() - 30)
+            ):
+                break
+            if entry.target == user:
+                if entry.reason is None:
+                    reason = "No reason."
+                else:
+                    reason = entry.reason
+
+                embed = await self.build_embed(entry,"Kick")
+                await channel.send(embed=embed)  
+                
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        config = await self.get_guild_config(before.guild.id)
+        channel = config and config.mod_logs
+        role_id = config and config.mute_role_id
+        
+        if role_id is None:
+            return
+
+
+        if channel is None:
+            return
+
+        if before.id == self.bot.user.id:
+            return
+
+        timestamp = datetime.utcnow()
+        limit = datetime.utcfromtimestamp(timee.time() - 60)
+        guild = after.guild
+
+        if after.roles or before.roles:
+            if after.roles == before.roles:
+                if before.roles != after.roles:
+                    pass
+                return
+
+            log = await self.find_log(
+                guild,
+                discord.AuditLogAction.member_role_update,
+                lambda e: e.target == after
+                and e.created_at.replace(tzinfo=pytz.UTC)
+                > limit.replace(tzinfo=pytz.UTC),
+            )
+
+            if log is None:
+                await asyncio.sleep(1)
+                log = await self.find_log(
+                    guild,
+                    discord.AuditLogAction.member_role_update,
+                    lambda e: e.target == after
+                    and e.created_at.replace(tzinfo=pytz.UTC)
+                    > limit.replace(tzinfo=pytz.UTC),
+                )
+
+            if log is not None:
+                if log.reason is None:
+                    reason = "No reason."
+                else:
+                    reason = log.reason
+
+                if log.before.roles == [] and log.after:
+                    if log.after.roles[0].id == role_id:
+
+                        embed = await self.build_embed(log,"Mute")
+                        await channel.send(embed=embed)  
+
+                elif log.before and log.after.roles == []:
+                    if log.before.roles[0].id == role_id:
+
+                        embed = await self.build_embed(log,"Unmute")
+                        await channel.send(embed=embed)                              
+
 
 def setup(bot):
     bot.add_cog(Mod(bot))

@@ -294,9 +294,9 @@ class Meta(commands.Cog):
         try:
             await self.bot.set_guild_prefixes(ctx.guild, current_prefixes)
         except Exception as e:
-            await ctx.send(f'{ctx.tick(False)} {e}')
+            await ctx.send(f'{e}')
         else:
-            await ctx.send(ctx.tick(True))
+            await ctx.send("\N{OK HAND SIGN}")
 
     @prefix_add.error
     async def prefix_add_error(self, ctx, error):
@@ -324,9 +324,9 @@ class Meta(commands.Cog):
         try:
             await self.bot.set_guild_prefixes(ctx.guild, current_prefixes)
         except Exception as e:
-            await ctx.send(f'{ctx.tick(False)} {e}')
+            await ctx.send(f'{e}')
         else:
-            await ctx.send(ctx.tick(True))
+            await ctx.send("\N{OK HAND SIGN}")
 
     @prefix.command(name='clear')
     @checks.is_mod()
@@ -339,7 +339,7 @@ class Meta(commands.Cog):
         """
 
         await self.bot.set_guild_prefixes(ctx.guild, [])
-        await ctx.send(ctx.tick(True))
+        await ctx.send("\N{OK HAND SIGN}")
 
     @commands.command()
     async def source(self, ctx, *, command: str = None):
@@ -478,8 +478,8 @@ class Meta(commands.Cog):
 
         channel_info = []
         key_to_emoji = {
-            discord.TextChannel: '<:text_channel:586339098172850187>',
-            discord.VoiceChannel: '<:voice_channel:586339098524909604>',
+            discord.TextChannel: 'Text Channels:',
+            discord.VoiceChannel: 'Voice Channels:',
         }
         for key, total in totals.items():
             secrets = secret[key]

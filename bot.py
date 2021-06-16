@@ -22,14 +22,14 @@ log = logging.getLogger(__name__)
 
 initial_extensions = (
     'cogs.meta',
-    'cogs.splatoon',
-    'cogs.rng',
+    #'cogs.splatoon',
+    #'cogs.rng',
     'cogs.mod',
-    'cogs.profile',
+    #'cogs.profile',
     'cogs.tags',
-    'cogs.lounge',
-    'cogs.carbonitex',
-    'cogs.api',
+    #'cogs.lounge',
+    #'cogs.carbonitex',
+    #'cogs.api',
     'cogs.stars',
     'cogs.admin',
     'cogs.buttons',
@@ -37,8 +37,8 @@ initial_extensions = (
     'cogs.stats',
     'cogs.emoji',
     'cogs.config',
-    'cogs.dpy',
-    'cogs.funhouse',
+    #'cogs.dpy',
+    #'cogs.funhouse',
 )
 
 def _prefix_callable(bot, msg):
